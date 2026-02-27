@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Calvin Watford <cwatford@slack-corp.com>
+Date: Thu, 27 Feb 2026 00:00:00 +0000
+Subject: fix: handle unknown ObjC property attribute flag in Mantle
+
+macOS 14.4+ / Xcode 15+ encodes optional properties with a '?' flag in
+ObjC property attribute strings (e.g. "T@"NSString",?,R,C"). Mantle's
+mtl_copyPropertyAttributes does not handle this flag, causing it to log
+errors and — more critically — fail to decode properties used by
+SQRLShipItRequest, leaving targetBundleURL nil and aborting updates.
+
+Skip unrecognized single-character flags instead of only logging an
+error, matching how 't' (old-style type encoding) is already handled.
+
+Upstream: https://github.com/Mantle/Mantle/issues/899
+
+diff --git a/vendor/Mantle/Mantle/extobjc/MTLEXTRuntimeExtensions.m b/vendor/Mantle/Mantle/extobjc/MTLEXTRuntimeExtensions.m
+--- a/vendor/Mantle/Mantle/extobjc/MTLEXTRuntimeExtensions.m
++++ b/vendor/Mantle/Mantle/extobjc/MTLEXTRuntimeExtensions.m
+@@ -666,7 +666,11 @@ mtl_propertyAttributes *mtl_copyPropertyAttributes (objc_property_t property) {
+
+ 			break;
+
+-		default:
++		default: {
+ 			fprintf(stderr, "ERROR: Unrecognized attribute string flag '%c' in attribute string \"%s\" for property %s\n", flag, attrString, property_getName(property));
++			// Skip past any value associated with this flag so parsing
++			// can continue with the next attribute.
++			while (*next != ',' && *next != '\0')
++				++next;
++		}
+ 		}
+ 	}
