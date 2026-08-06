@@ -32,6 +32,8 @@
 #if BUILDFLAG(IS_MAC)
 #include "shell/browser/webauthn/electron_authenticator_request_delegate.h"
 #include "shell/browser/webauthn/electron_platform_passkeys_discovery.h"
+#include "third_party/blink/public/mojom/devtools/console_message.mojom.h"
+#include "url/origin.h"
 #endif
 
 namespace electron {
@@ -54,6 +56,21 @@ std::string CredentialIdFor(
   }
   return {};
 }
+
+#if BUILDFLAG(IS_MAC)
+// Matches Chromium's notion of a cross-origin (iframe) WebAuthn ceremony: the
+// requesting frame must be same-origin with all of its ancestors.
+bool IsSameOriginWithAncestors(content::RenderFrameHost* frame) {
+  const url::Origin& origin = frame->GetLastCommittedOrigin();
+  for (content::RenderFrameHost* parent = frame->GetParent(); parent;
+       parent = parent->GetParent()) {
+    if (!parent->GetLastCommittedOrigin().IsSameOriginWith(origin)) {
+      return false;
+    }
+  }
+  return true;
+}
+#endif
 
 }  // namespace
 
@@ -271,8 +288,13 @@ void ElectronAuthenticatorRequestClientDelegate::
 void ElectronAuthenticatorRequestClientDelegate::
     MaybeEmitSelectAuthenticatorEvent() {
   if (pending_authenticators_.size() == 1) {
-    request_callback_.Run(pending_authenticators_[0].id);
+    // Dispatching can complete the request synchronously and destroy |this|
+    // (the request state owns the delegate), so consume member state first and
+    // touch nothing after the Run. Same pattern as OnAccountSelected.
+    std::string id = std::move(pending_authenticators_[0].id);
     pending_authenticators_.clear();
+    auto callback = request_callback_;
+    callback.Run(id);
     return;
   }
 
@@ -330,12 +352,22 @@ void ElectronAuthenticatorRequestClientDelegate::
 
 void ElectronAuthenticatorRequestClientDelegate::
     DispatchDefaultAuthenticator() {
+  // Empty means a listener already consumed the selection synchronously via
+  // the emit callback and then threw — EmitEvent reports "not handled" for a
+  // throwing listener. The callback's choice stands; don't dispatch again.
+  if (pending_authenticators_.empty()) {
+    return;
+  }
   auto auth = std::ranges::find(pending_authenticators_, "platformPasskeys",
                                 &PendingAuthenticator::display_name);
-  request_callback_.Run(auth != pending_authenticators_.end()
-                            ? auth->id
-                            : pending_authenticators_.front().id);
+  // Dispatching can complete the request synchronously and destroy |this|, so
+  // consume member state first and touch nothing after the Run.
+  std::string id = std::move(auth != pending_authenticators_.end()
+                                 ? auth->id
+                                 : pending_authenticators_.front().id);
   pending_authenticators_.clear();
+  auto callback = request_callback_;
+  callback.Run(id);
 }
 
 void ElectronAuthenticatorRequestClientDelegate::OnAuthenticatorSelected(
@@ -349,27 +381,28 @@ void ElectronAuthenticatorRequestClientDelegate::OnAuthenticatorSelected(
   }
 
   std::string selected_name;
-  if (!args->GetNext(&selected_name) || selected_name.empty()) {
-    if (cancel_callback_) {
-      std::move(cancel_callback_).Run();
-    }
+  const bool has_name = args->GetNext(&selected_name) && !selected_name.empty();
+  const auto selected =
+      has_name ? std::ranges::find(pending_authenticators_, selected_name,
+                                   &PendingAuthenticator::display_name)
+               : pending_authenticators_.end();
+
+  // Running these callbacks can complete the request synchronously and destroy
+  // |this| (the request state owns the delegate), so consume member state
+  // first and touch nothing after the Run. Same pattern as OnAccountSelected.
+  if (selected != pending_authenticators_.end()) {
+    std::string id = std::move(selected->id);
     pending_authenticators_.clear();
+    auto callback = request_callback_;
+    callback.Run(id);
     return;
   }
 
-  for (const auto& auth : pending_authenticators_) {
-    if (auth.display_name == selected_name) {
-      request_callback_.Run(auth.id);
-      pending_authenticators_.clear();
-      return;
-    }
-  }
-
-  // Unknown name — cancel.
+  // No argument, empty, or unknown name — cancel.
+  pending_authenticators_.clear();
   if (cancel_callback_) {
     std::move(cancel_callback_).Run();
   }
-  pending_authenticators_.clear();
 }
 
 #if BUILDFLAG(IS_MAC)
@@ -378,9 +411,20 @@ ElectronAuthenticatorRequestClientDelegate::CreatePlatformDiscoveries() {
   std::vector<std::unique_ptr<device::FidoDiscoveryBase>> discoveries;
   if (ElectronWebAuthenticationDelegate::IsPlatformPasskeysEnabled()) {
     auto* rfh = content::RenderFrameHost::FromID(render_frame_host_id_);
-    if (rfh) {
+    if (rfh && IsSameOriginWithAncestors(rfh)) {
       discoveries.push_back(
           std::make_unique<ElectronPlatformPasskeysDiscovery>(rfh));
+    } else if (rfh) {
+      // Apple's public passkey API can't represent a cross-origin (iframe)
+      // ceremony (see the crossOrigin rejects in the authenticator), so don't
+      // offer the authenticator at all — other transports (e.g. a security
+      // key, or Touch ID when configured) can still serve the request.
+      rfh->AddMessageToConsole(
+          blink::mojom::ConsoleMessageLevel::kWarning,
+          "WebAuthn platform passkeys are unavailable to cross-origin "
+          "(iframe) requests: Apple's ASAuthorizationController cannot "
+          "fulfill them. Other authenticators can still serve the request; "
+          "the Touch ID authenticator supports iframes.");
     }
   }
   return discoveries;
